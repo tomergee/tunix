@@ -56,6 +56,7 @@ Usage:
 
 import asyncio
 import collections
+import hashlib
 import json
 import logging
 import os
@@ -64,6 +65,8 @@ import threading
 import time
 
 from datasets import load_dataset
+from jinja2 import Template
+import yaml
 from guarded_swe_env import GuardedSWEEnv
 from huggingface_hub import snapshot_download
 import jax
@@ -107,6 +110,16 @@ MAX_RESPONSE_LENGTH = int(
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "256"))
 TIMEOUT = float(os.getenv("TIMEOUT", "600"))
 TASKS_LIMIT = int(os.getenv("TASKS_LIMIT", "0"))
+
+BACKEND = os.getenv("BACKEND", "kubernetes")
+WARMPOOL_STRATEGY = os.getenv("WARMPOOL_STRATEGY", "none")  # none, naive, sliding
+WARMPOOL_WINDOW_SIZE = int(os.getenv("WARMPOOL_WINDOW_SIZE", "2"))
+MAX_WARMPOOL_SIZE = int(os.getenv("MAX_WARMPOOL_SIZE", "32"))
+
+DOCKER_PATH = "/root/.venv/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+WARMPOOL_GROUP = "extensions.agents.x-k8s.io"
+WARMPOOL_VERSION = "v1alpha1"
+WARMPOOL_PLURAL = "sandboxwarmpools"
 MAX_CONTEXT_LIMIT = int(
     os.getenv("MAX_CONTEXT_LIMIT", str(max(1, MAX_MODEL_LEN - 256)))
 )
@@ -175,6 +188,10 @@ dataset = load_dataset(
 entries = [e for e in dataset if "docker_image" in e]
 if TASKS_LIMIT > 0:
   entries = entries[:TASKS_LIMIT]
+
+if WARMPOOL_STRATEGY == "sliding":
+  logger.info("Sorting entries by docker_image for sliding window warmpools.")
+  entries = sorted(entries, key=lambda e: e["docker_image"])
 
 unique_images = set(e["docker_image"] for e in entries)
 logger.info(
@@ -515,6 +532,131 @@ class LoggedGuardedSWEEnv(_EvalLoggingEnvMixin, GuardedSWEEnv):
   pass
 
 
+TEMPLATE_STR = """apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: {{ template_name }}
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        sandbox: {{ template_name }}
+    spec:
+      runtimeClassName: gvisor
+      restartPolicy: Never
+      nodeSelector:
+        {{ nodeSelector_key }}: {{ nodeSelector_val }}
+      tolerations:
+      - key: "node.kubernetes.io/disk-pressure"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 10800
+      containers:
+      - name: agent-runtime
+        image: "{{ image_name }}"
+        command: {{ command }}
+        args: {{ args }}
+        stdin: true
+        tty: true
+        env: {{ env | default([]) | tojson }}
+        resources:
+          requests:
+            cpu: "1"
+            memory: "1Gi"
+"""
+
+
+def get_sandbox_template_name(image_name: str) -> str:
+  img_hash = hashlib.md5(image_name.encode()).hexdigest()[:12]
+  return f"r2e-img-{img_hash}"
+
+
+def ensure_sandbox_template_exists(custom_api, image_name, template_name):
+  try:
+    custom_api.get_namespaced_custom_object(
+        group="extensions.agents.x-k8s.io",
+        version="v1alpha1",
+        namespace="default",
+        plural="sandboxtemplates",
+        name=template_name,
+    )
+    logger.info("SandboxTemplate '%s' already exists.", template_name)
+    return
+  except client.ApiException as e:
+    if e.status != 404:
+      raise e
+
+  logger.info("Creating SandboxTemplate '%s'...", template_name)
+
+  runtime_params = {
+      "template_name": template_name,
+      "image_name": image_name,
+      "command": ["/bin/sh", "-c"],
+      "args": ["/bin/bash"],
+      "env": [{"name": "PATH", "value": DOCKER_PATH}],
+      "nodeSelector_key": os.getenv(
+          "NODE_SELECTOR_KEY", "cloud.google.com/gke-nodepool"
+      ),
+      "nodeSelector_val": os.getenv(
+          "NODE_SELECTOR_VAL", "deepswe-cpu-pool"
+      ),
+  }
+
+  t = Template(TEMPLATE_STR, trim_blocks=True)
+  rendered_yaml = t.render(runtime_params)
+  manifest = yaml.safe_load(rendered_yaml)
+
+  custom_api.create_namespaced_custom_object(
+      group="extensions.agents.x-k8s.io",
+      version="v1alpha1",
+      namespace="default",
+      plural="sandboxtemplates",
+      body=manifest,
+  )
+
+
+def create_warmpool(custom_api, name, template_name, size):
+  manifest = {
+      "apiVersion": f"{WARMPOOL_GROUP}/{WARMPOOL_VERSION}",
+      "kind": "SandboxWarmPool",
+      "metadata": {"name": name, "namespace": "default"},
+      "spec": {"templateRef": {"name": template_name}, "size": size},
+  }
+  try:
+    custom_api.create_namespaced_custom_object(
+        group=WARMPOOL_GROUP,
+        version=WARMPOOL_VERSION,
+        namespace="default",
+        plural=WARMPOOL_PLURAL,
+        body=manifest,
+    )
+    logger.info("Created WarmPool '%s' with size %d", name, size)
+  except client.ApiException as e:
+    if e.status == 409:
+      logger.info("WarmPool '%s' already exists.", name)
+    else:
+      raise e
+
+
+def delete_warmpool(custom_api, name):
+  logger.info("Deleting WarmPool '%s'...", name)
+  try:
+    custom_api.delete_namespaced_custom_object(
+        group=WARMPOOL_GROUP,
+        version=WARMPOOL_VERSION,
+        namespace="default",
+        plural=WARMPOOL_PLURAL,
+        name=name,
+        body=client.V1DeleteOptions(grace_period_seconds=0),
+    )
+    logger.info("Deleted WarmPool '%s'", name)
+  except client.ApiException as e:
+    if e.status == 404:
+      logger.warning("WarmPool '%s' not found.", name)
+    else:
+      raise e
+
+
 def pairs_generator():
   """Yield one full (agent, env) trajectory task per dataset entry."""
   for pair_index, entry in enumerate(entries):
@@ -525,13 +667,50 @@ def pairs_generator():
         max_steps=MAX_STEPS,
         pair_index=pair_index,
         group_id=pair_index,
+        backend=BACKEND,
     )
     yield agent, env
 
 
 async def run_evaluation():
   """Run evaluation with orchestrator-managed task-level parallelism."""
+  global entries
   os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+  k8s_custom_client = client.CustomObjectsApi()
+  active_warmpools = set()
+
+  # Group and sort entries if using sliding window to maximize cache locality
+  if WARMPOOL_STRATEGY == "sliding":
+    logger.info("Sorting entries by docker_image for sliding window warmpools.")
+    entries = sorted(entries, key=lambda e: e["docker_image"])
+
+  image_totals = Counter(e["docker_image"] for e in entries)
+  unique_images_order = list(dict.fromkeys(e["docker_image"] for e in entries))
+  image_finished = {img: 0 for img in unique_images_order}
+  next_image_to_warm_idx = 0
+
+  # Setup initial warmpools
+  if WARMPOOL_STRATEGY == "naive":
+    logger.info("Setting up naive parallel warmpools...")
+    for img, count in image_totals.items():
+      template_name = get_sandbox_template_name(img)
+      ensure_sandbox_template_exists(k8s_custom_client, img, template_name)
+      size = min(count, MAX_WARMPOOL_SIZE)
+      pool_name = f"pool-{template_name}"
+      create_warmpool(k8s_custom_client, pool_name, template_name, size)
+      active_warmpools.add(img)
+  elif WARMPOOL_STRATEGY == "sliding":
+    logger.info("Setting up initial sliding window warmpools...")
+    for i in range(min(WARMPOOL_WINDOW_SIZE, len(unique_images_order))):
+      img = unique_images_order[i]
+      template_name = get_sandbox_template_name(img)
+      ensure_sandbox_template_exists(k8s_custom_client, img, template_name)
+      size = min(image_totals[img], MAX_WARMPOOL_SIZE)
+      pool_name = f"pool-{template_name}"
+      create_warmpool(k8s_custom_client, pool_name, template_name, size)
+      active_warmpools.add(img)
+      next_image_to_warm_idx += 1
 
   orchestrator = RolloutOrchestrator(
       engine_cls=EvalTrajectoryCollectEngine,
@@ -560,48 +739,86 @@ async def run_evaluation():
 
   await asyncio.sleep(0)
 
-  async for batch in orchestrator.yield_batches(batch_size=1):
-    for item in batch:
-      traj = item.traj
-      entry = entries[item.pair_index]
-      guard_reasons = sorted({
-          (getattr(step, "info", {}) or {}).get("guard_reason", "unknown")
-          for step in traj.steps
-          if (getattr(step, "info", {}) or {}).get("guard_blocked")
-      })
-      result = {
-          "pair_index": item.pair_index,
-          "instance_id": entry.get("instance_id", item.pair_index),
-          "reward": float(traj.reward),
-          "num_steps": len(traj.steps),
-          "status": getattr(traj.status, "name", str(traj.status)),
-          "guard_blocked_steps": sum(
-              1
-              for step in traj.steps
-              if (getattr(step, "info", {}) or {}).get("guard_blocked")
-          ),
-          "guard_reasons": guard_reasons,
-      }
-      results.append(result)
-      elapsed = time.time() - start_time
-      logger.info(
-          "[%d/%d] Instance %s: reward=%.1f, steps=%d, status=%s (%.0fs"
-          " elapsed)",
-          len(results),
-          len(entries),
-          result["instance_id"],
-          result["reward"],
-          result["num_steps"],
-          result["status"],
-          elapsed,
-      )
-      logger.info(
-          "%s[%s] FINAL TRAJECTORY REWARD=%.1f%s",
-          ANSI_RED,
-          result["instance_id"],
-          result["reward"],
-          ANSI_RESET,
-      )
+  try:
+    async for batch in orchestrator.yield_batches(batch_size=1):
+      for item in batch:
+        traj = item.traj
+        entry = entries[item.pair_index]
+        img = entry["docker_image"]
+        guard_reasons = sorted({
+            (getattr(step, "info", {}) or {}).get("guard_reason", "unknown")
+            for step in traj.steps
+            if (getattr(step, "info", {}) or {}).get("guard_blocked")
+        })
+        result = {
+            "pair_index": item.pair_index,
+            "instance_id": entry.get("instance_id", item.pair_index),
+            "reward": float(traj.reward),
+            "num_steps": len(traj.steps),
+            "status": getattr(traj.status, "name", str(traj.status)),
+            "guard_blocked_steps": sum(
+                1
+                for step in traj.steps
+                if (getattr(step, "info", {}) or {}).get("guard_blocked")
+            ),
+            "guard_reasons": guard_reasons,
+        }
+        results.append(result)
+        elapsed = time.time() - start_time
+        logger.info(
+            "[%d/%d] Instance %s: reward=%.1f, steps=%d, status=%s (%.0fs"
+            " elapsed)",
+            len(results),
+            len(entries),
+            result["instance_id"],
+            result["reward"],
+            result["num_steps"],
+            result["status"],
+            elapsed,
+        )
+        logger.info(
+            "%s[%s] FINAL TRAJECTORY REWARD=%.1f%s",
+            ANSI_RED,
+            result["instance_id"],
+            result["reward"],
+            ANSI_RESET,
+        )
+
+        # Dynamic warmpool management for sliding window
+        if WARMPOOL_STRATEGY == "sliding":
+          image_finished[img] += 1
+          if image_finished[img] == image_totals[img]:
+            logger.info("All tasks for image %s finished. Cleaning up warmpool.", img)
+            template_name = get_sandbox_template_name(img)
+            pool_name = f"pool-{template_name}"
+            delete_warmpool(k8s_custom_client, pool_name)
+            active_warmpools.discard(img)
+
+            if next_image_to_warm_idx < len(unique_images_order):
+              next_img = unique_images_order[next_image_to_warm_idx]
+              logger.info("Pre-warming next image in window: %s", next_img)
+              next_template_name = get_sandbox_template_name(next_img)
+              ensure_sandbox_template_exists(
+                  k8s_custom_client, next_img, next_template_name
+              )
+              next_size = min(image_totals[next_img], MAX_WARMPOOL_SIZE)
+              next_pool_name = f"pool-{next_template_name}"
+              create_warmpool(
+                  k8s_custom_client, next_pool_name, next_template_name, next_size
+              )
+              active_warmpools.add(next_img)
+              next_image_to_warm_idx += 1
+  finally:
+    # Cleanup remaining warmpools
+    if active_warmpools:
+      logger.info("Cleaning up remaining warmpools...")
+      for img in list(active_warmpools):
+        template_name = get_sandbox_template_name(img)
+        pool_name = f"pool-{template_name}"
+        try:
+          delete_warmpool(k8s_custom_client, pool_name)
+        except Exception as e:
+          logger.error("Failed to cleanup warmpool %s at end: %s", pool_name, e)
 
   await producer
   return results
